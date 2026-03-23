@@ -52,6 +52,16 @@ pub struct VerificationChallenge {
     pub url: String,
 }
 
+/// 二维码登录挑战。
+#[derive(Clone, Debug)]
+pub struct QrLoginChallenge {
+    /// 终端应当渲染的扫码链接。
+    pub login_url: String,
+    /// 小米返回的二维码图片地址。
+    pub qr_url: String,
+    poll_url: Url,
+}
+
 /// 初步登录的结果。
 #[derive(Clone, Debug)]
 pub enum LoginStep {
@@ -67,6 +77,15 @@ const LOGIN_UA: &str = "APP/com.xiaomi.mihome APPV/6.0.103 iosPassportSDK/3.9.0 
 
 impl Login {
     pub fn new(username: impl Into<String>, password: impl AsRef<[u8]>) -> crate::Result<Self> {
+        Self::with_password_hash(username.into(), hash_password(password))
+    }
+
+    /// 构造一个仅用于二维码登录的实例。
+    pub fn new_qr() -> crate::Result<Self> {
+        Self::with_password_hash(String::new(), String::new())
+    }
+
+    fn with_password_hash(username: String, password_hash: String) -> crate::Result<Self> {
         let server = Url::parse(LOGIN_SERVER)?;
 
         // 预先添加 Cookies
@@ -89,8 +108,8 @@ impl Login {
         Ok(Self {
             client,
             server,
-            username: username.into(),
-            password_hash: hash_password(password),
+            username,
+            password_hash,
             cookie_store,
         })
     }
@@ -267,6 +286,119 @@ impl Login {
         Ok(response)
     }
 
+    /// 获取二维码登录挑战。
+    pub async fn qr_challenge(&self) -> crate::Result<QrLoginChallenge> {
+        let response = self.raw_login().await?;
+        let location = response
+            .get("location")
+            .and_then(Value::as_str)
+            .filter(|location| !location.is_empty())
+            .ok_or_else(|| crate::Error::Login(login_error_message(&response)))?;
+        let mut query = self
+            .account_url(location)?
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        query.extend([
+            ("theme".to_owned(), String::new()),
+            ("bizDeviceType".to_owned(), String::new()),
+            ("_hasLogo".to_owned(), "false".to_owned()),
+            ("_qrsize".to_owned(), "240".to_owned()),
+            ("_dc".to_owned(), now_millis().to_string()),
+        ]);
+        let url = Url::parse_with_params("https://account.xiaomi.com/longPolling/loginUrl", &query)?;
+        let response = self
+            .send_with_retry("获取扫码登录二维码请求", || self.client.get(url.clone()))
+            .await?
+            .error_for_status()?;
+        self.trace_response_cookies("获取扫码登录二维码响应", &response);
+        self.trace_cookie_state("获取扫码登录二维码响应后")?;
+        let bytes = response.bytes().await?;
+        let response = decode_json_bytes(&bytes)?;
+        trace!("获取到扫码登录二维码: {response}");
+
+        Ok(QrLoginChallenge {
+            login_url: response
+                .get("loginUrl")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| crate::Error::Login("扫码登录响应缺少 `loginUrl`".to_owned()))?
+                .to_owned(),
+            qr_url: response
+                .get("qr")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| crate::Error::Login("扫码登录响应缺少 `qr`".to_owned()))?
+                .to_owned(),
+            poll_url: Url::parse(
+                response
+                    .get("lp")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| crate::Error::Login("扫码登录响应缺少 `lp`".to_owned()))?,
+            )?,
+        })
+    }
+
+    /// 等待用户扫码并完成登录。
+    pub async fn wait_for_qr_scan(&self, challenge: &QrLoginChallenge) -> crate::Result<()> {
+        let response = self
+            .send_with_retry("扫码登录轮询请求", || {
+                self.client.get(challenge.poll_url.clone())
+            })
+            .await?
+            .error_for_status()?;
+        self.trace_response_cookies("扫码登录轮询响应", &response);
+        self.trace_cookie_state("扫码登录轮询响应后")?;
+        let bytes = response.bytes().await?;
+        let response = decode_json_bytes(&bytes)?;
+        trace!("扫码登录轮询结果: {response}");
+
+        if has_auth_fields(&response) {
+            self.get_token(serde_json::from_value(response)?).await?;
+            return Ok(());
+        }
+
+        let location = response
+            .get("location")
+            .and_then(Value::as_str)
+            .filter(|location| !location.is_empty())
+            .ok_or_else(|| crate::Error::Login(login_error_message(&response)))?;
+        let url = self.account_url(location)?;
+        let response = self
+            .send_with_retry("扫码登录回调请求", || self.client.get(url.clone()))
+            .await?;
+        self.trace_response_cookies("扫码登录回调响应", &response);
+        trace!(
+            "扫码登录回调完成: status={}, url={}",
+            response.status(),
+            response.url()
+        );
+        self.trace_cookie_state("扫码登录回调后")?;
+
+        if self.has_cookie("serviceToken") {
+            return Ok(());
+        }
+
+        let bytes = response.bytes().await?;
+        if looks_like_json_bytes(&bytes) {
+            let response = decode_json_bytes(&bytes)?;
+            trace!("扫码登录回调响应体: {response}");
+            if has_auth_fields(&response) {
+                self.get_token(serde_json::from_value(response)?).await?;
+                return Ok(());
+            }
+        }
+
+        if self.has_cookie("serviceToken") {
+            Ok(())
+        } else {
+            Err(crate::Error::Login(
+                "扫码登录成功，但未获取到 `serviceToken`".to_owned(),
+            ))
+        }
+    }
+
     /// 消耗 `Login` 并提取 Cookies，其中存储了当前的登录状态。
     pub fn into_cookie_store(self) -> Arc<CookieStoreMutex> {
         self.cookie_store
@@ -409,6 +541,14 @@ impl Login {
         trace!("手动写入 Cookie: {}", cookie);
 
         Ok(())
+    }
+
+    fn has_cookie(&self, name: &str) -> bool {
+        self.cookie_store
+            .lock()
+            .unwrap()
+            .iter_any()
+            .any(|cookie| cookie.name() == name)
     }
 
     fn trace_response_cookies(&self, label: &str, response: &Response) {
@@ -595,6 +735,12 @@ fn decode_json_bytes(bytes: &[u8]) -> crate::Result<Value> {
     let bytes = bytes.strip_prefix(b"&&&START&&&").unwrap_or(bytes);
 
     Ok(serde_json::from_slice(bytes)?)
+}
+
+fn looks_like_json_bytes(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"&&&START&&&").unwrap_or(bytes);
+
+    matches!(bytes.first(), Some(b'{') | Some(b'['))
 }
 
 fn verification_api(flag: i64) -> Option<&'static str> {

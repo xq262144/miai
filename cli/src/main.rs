@@ -17,6 +17,7 @@ use miai::{
     login::{CaptchaChallenge, Login, LoginResponse, LoginStep, VerificationChallenge},
 };
 use once_cell::unsync::OnceCell;
+use qrcode::{EcLevel, QrCode, render::unicode};
 use serde_json::Value;
 use time::{OffsetDateTime, UtcOffset};
 use tracing_subscriber::EnvFilter;
@@ -33,8 +34,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
 
-    if matches!(&cli.command, Commands::Login) {
-        let xiaoai = prompt_login().await?;
+    if let Commands::Login { qr } = &cli.command {
+        let xiaoai = if *qr {
+            prompt_qr_login().await?
+        } else {
+            prompt_login().await?
+        };
         save_auth_file(&cli.auth_file, &xiaoai)?;
         return Ok(());
     }
@@ -170,6 +175,19 @@ async fn prompt_login() -> anyhow::Result<Xiaoai> {
     };
 
     login.get_token(auth_response).await?;
+
+    Ok(Xiaoai::from_login(login)?)
+}
+
+async fn prompt_qr_login() -> anyhow::Result<Xiaoai> {
+    let login = Login::new_qr()?;
+    let challenge = login.qr_challenge().await?;
+    println!("请使用米家 APP 扫描下方二维码完成登录。");
+    print_qr_code(&challenge.login_url)?;
+    println!("扫码链接: {}", challenge.login_url);
+    println!("二维码图片地址: {}", challenge.qr_url);
+    println!("等待扫码确认...");
+    login.wait_for_qr_scan(&challenge).await?;
 
     Ok(Xiaoai::from_login(login)?)
 }
@@ -318,7 +336,11 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// 登录以获得认证
-    Login,
+    Login {
+        /// 使用二维码扫码登录
+        #[arg(long)]
+        qr: bool,
+    },
     /// 列出设备
     Device,
     /// 播报文本
@@ -348,6 +370,32 @@ enum Commands {
         method: String,
         message: String,
     },
+}
+
+fn print_qr_code(content: &str) -> anyhow::Result<()> {
+    let qr = QrCode::with_error_correction_level(content.as_bytes(), EcLevel::L)?;
+    let columns = terminal_columns();
+    let width_with_quiet_zone = qr.width() + 8;
+    let use_quiet_zone = columns.is_none_or(|columns| columns >= width_with_quiet_zone);
+    let text = qr
+        .render::<unicode::Dense1x2>()
+        .quiet_zone(use_quiet_zone)
+        .module_dimensions(1, 1)
+        .build();
+    if let Some(columns) = columns
+        && columns < qr.width()
+    {
+        eprintln!(
+            "提示: 当前终端宽度只有 {columns} 列，二维码仍可能换行；建议放大终端，或直接打开下方扫码链接。"
+        );
+    }
+    println!("{text}");
+
+    Ok(())
+}
+
+fn terminal_columns() -> Option<usize> {
+    env::var("COLUMNS").ok()?.parse().ok()
 }
 
 struct DisplayDeviceInfo<'a>(&'a DeviceInfo);
