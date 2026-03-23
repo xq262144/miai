@@ -2,27 +2,39 @@ use std::{
     collections::HashMap,
     io::{BufRead, Write},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64ct::{Base64, Encoding};
 use cookie_store::{
     RawCookie,
     serde::json::{load_all, save_incl_expired_and_nonpersistent},
 };
-use reqwest::{Client, Url};
+use hmac::{Hmac, Mac};
+use reqwest::{
+    Client, Url,
+    header::{COOKIE, HeaderMap, HeaderValue},
+};
 use reqwest_cookie_store::CookieStoreMutex;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Value, json};
+use sha1::{Digest as Sha1Digest, Sha1};
+use sha2::Sha256;
 use time::OffsetDateTime;
 use tracing::trace;
 
 use crate::{
-    XiaoaiResponse, conversation,
+    Error, XiaoaiResponse, conversation,
     login::{Login, LoginStep},
     util::random_id,
 };
 
 const API_SERVER: &str = "https://api2.mina.mi.com/";
 const API_UA: &str = "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103 MICO/iOSApp/appStore/6.0.103";
+const ACCOUNT_SERVER: &str = "https://account.xiaomi.com/pass/";
+const ACCOUNT_UA: &str = "APP/com.xiaomi.mihome APPV/6.0.103 iosPassportSDK/3.9.0 iOS/14.4 miHSTS";
+const MIIO_SERVER: &str = "https://api.io.mi.com/app";
+const MIIO_UA: &str = "iOS-14.4-6.0.103-iPhone12,3--D7744744F7AF32F0544445285880DD63E47D9BE9-8816080-84A3F44E137B71AE-iPhone";
 
 /// 提供小爱服务请求。
 ///
@@ -32,6 +44,7 @@ const API_UA: &str = "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14
 pub struct Xiaoai {
     client: Client,
     cookie_store: Arc<CookieStoreMutex>,
+    miio_auth: Arc<std::sync::Mutex<Option<MiioAuth>>>,
     server: Url,
 }
 
@@ -59,6 +72,7 @@ impl Xiaoai {
         Ok(Self {
             client,
             cookie_store,
+            miio_auth: Arc::new(std::sync::Mutex::new(None)),
             server: Url::parse(API_SERVER)?,
         })
     }
@@ -90,15 +104,20 @@ impl Xiaoai {
         let request_id = random_request_id();
         let url =
             Url::parse_with_params(self.server.join(uri)?.as_str(), [("requestId", request_id)])?;
+        trace!("小爱 GET 请求: {url}");
         let response = self
             .client
-            .get(url)
+            .get(url.clone())
             .send()
             .await?
             .error_for_status()?
             .json::<XiaoaiResponse>()
-            .await?
-            .error_for_code()?;
+            .await?;
+        trace!(
+            "小爱 GET 响应: url={url}, code={}, message={}, data={}",
+            response.code, response.message, response.data
+        );
+        let response = response.error_for_code()?;
 
         Ok(response)
     }
@@ -114,16 +133,21 @@ impl Xiaoai {
         let request_id = random_request_id();
         form.insert("requestId", &request_id);
         let url = self.server.join(uri)?;
+        trace!("小爱 POST 请求: url={url}, form={form:?}");
         let response = self
             .client
-            .post(url)
+            .post(url.clone())
             .form(&form)
             .send()
             .await?
             .error_for_status()?
             .json::<XiaoaiResponse>()
-            .await?
-            .error_for_code()?;
+            .await?;
+        trace!(
+            "小爱 POST 响应: url={url}, code={}, message={}, data={}",
+            response.code, response.message, response.data
+        );
+        let response = response.error_for_code()?;
 
         Ok(response)
     }
@@ -154,6 +178,7 @@ impl Xiaoai {
         Ok(Self {
             client,
             cookie_store,
+            miio_auth: Arc::new(std::sync::Mutex::new(None)),
             server: Url::parse(API_SERVER)?,
         })
     }
@@ -166,6 +191,7 @@ impl Xiaoai {
         method: &str,
         message: &str,
     ) -> crate::Result<XiaoaiResponse> {
+        trace!("UBUS 调用: device_id={device_id}, path={path}, method={method}, message={message}");
         let form = HashMap::from([
             ("deviceId", device_id),
             ("method", method),
@@ -178,6 +204,21 @@ impl Xiaoai {
 
     /// 请求小爱设备播报文本。
     pub async fn tts(&self, device_id: &str, text: &str) -> crate::Result<XiaoaiResponse> {
+        if let Some(info) = self.device_info_for_command(device_id).await? {
+            if let Some(command) = miio_tts_command(&info.hardware) {
+                trace!(
+                    "设备 {device_id} 命中 MiIO TTS 兼容分支: hardware={}, miot_did={:?}, command={command}",
+                    info.hardware, info.miot_did
+                );
+                match self.miio_action(&info, command, [json!(text)]).await {
+                    Ok(response) => return Ok(response),
+                    Err(error) => {
+                        trace!("MiIO TTS 失败，回退到 ubus: {error}");
+                    }
+                }
+            }
+        }
+
         let message = json!({"text": text}).to_string();
 
         self.ubus_call(device_id, "mibrain", "text_to_speech", &message)
@@ -261,6 +302,24 @@ impl Xiaoai {
     ///
     /// 效果和口头询问一样。
     pub async fn nlp(&self, device_id: &str, text: &str) -> crate::Result<XiaoaiResponse> {
+        if let Some(info) = self.device_info_for_command(device_id).await? {
+            if let Some(command) = miio_ask_command(&info.hardware) {
+                trace!(
+                    "设备 {device_id} 命中 MiIO 提问兼容分支: hardware={}, miot_did={:?}, command={command}",
+                    info.hardware, info.miot_did
+                );
+                match self
+                    .miio_action(&info, command, [json!(text), json!(1)])
+                    .await
+                {
+                    Ok(response) => return Ok(response),
+                    Err(error) => {
+                        trace!("MiIO 提问失败，回退到 ubus: {error}");
+                    }
+                }
+            }
+        }
+
         let message = json!({
             "tts": 1,
             "nlp": 1,
@@ -354,6 +413,164 @@ impl Xiaoai {
 
         Ok(response)
     }
+
+    async fn device_info_for_command(&self, device_id: &str) -> crate::Result<Option<DeviceInfo>> {
+        Ok(self
+            .device_info()
+            .await?
+            .into_iter()
+            .find(|info| info.device_id == device_id))
+    }
+
+    async fn miio_action<I>(
+        &self,
+        info: &DeviceInfo,
+        command: &str,
+        args: I,
+    ) -> crate::Result<XiaoaiResponse>
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        let did = info
+            .miot_did
+            .as_deref()
+            .ok_or_else(|| Error::Login(format!("设备 `{}` 缺少 `miotDID`", info.device_id)))?;
+        let (siid, aiid) = parse_miio_action(command)?;
+        let params = json!({
+            "did": did,
+            "siid": siid,
+            "aiid": aiid,
+            "in": args.into_iter().collect::<Vec<_>>(),
+        });
+        let response = self
+            .miio_request("/miotspec/action", json!({ "params": params }))
+            .await?;
+
+        Ok(miio_response(response))
+    }
+
+    async fn miio_request(&self, uri: &str, payload: Value) -> crate::Result<Value> {
+        match self.miio_request_once(uri, &payload).await {
+            Ok(response) => Ok(response),
+            Err(first_error) if is_auth_error(&first_error) => {
+                trace!("MiIO 请求鉴权失败，重新登录 xiaomiio 后重试: {first_error}");
+                self.clear_miio_auth();
+                self.miio_request_once(uri, &payload).await
+            }
+            Err(first_error) => Err(first_error),
+        }
+    }
+
+    async fn miio_request_once(&self, uri: &str, payload: &Value) -> crate::Result<Value> {
+        let auth = self.miio_auth().await?;
+        let data = serde_json::to_string(payload)?;
+        let signed = sign_miio_data(uri, &data, &auth.ssecurity)?;
+        let cookie = format!(
+            "PassportDeviceId={}; userId={}; serviceToken={}",
+            auth.device_id, auth.user_id, auth.service_token
+        );
+        let url = Url::parse(&format!("{MIIO_SERVER}{uri}"))?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-xiaomi-protocal-flag-cli",
+            HeaderValue::from_static("PROTOCAL-HTTP2"),
+        );
+        let cookie_header = HeaderValue::from_str(&cookie)
+            .map_err(|error| Error::Login(format!("MiIO Cookie 无效: {error}")))?;
+        headers.insert(COOKIE, cookie_header);
+        trace!("MiIO 请求: url={url}, cookie={cookie:?}, payload={payload}, signed={signed:?}");
+        let response = self
+            .client
+            .post(url.clone())
+            .headers(headers)
+            .header(reqwest::header::USER_AGENT, MIIO_UA)
+            .form(&signed)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        trace!("MiIO 响应: status={status}, url={url}, body={body}");
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(Error::Login("MiIO 请求未授权".to_owned()));
+        }
+        if !status.is_success() {
+            return Err(Error::Login(format!(
+                "MiIO 请求失败: status={status}, body={body}"
+            )));
+        }
+
+        Ok(serde_json::from_str(&body)?)
+    }
+
+    async fn miio_auth(&self) -> crate::Result<MiioAuth> {
+        if let Some(auth) = self.miio_auth.lock().unwrap().clone() {
+            return Ok(auth);
+        }
+
+        let auth = self.login_xiaomiio().await?;
+        *self.miio_auth.lock().unwrap() = Some(auth.clone());
+
+        Ok(auth)
+    }
+
+    fn clear_miio_auth(&self) {
+        *self.miio_auth.lock().unwrap() = None;
+    }
+
+    async fn login_xiaomiio(&self) -> crate::Result<MiioAuth> {
+        let client = Client::builder()
+            .cookie_provider(self.cookie_store.clone())
+            .http1_only()
+            .user_agent(ACCOUNT_UA)
+            .build()?;
+        let url = Url::parse(ACCOUNT_SERVER)?.join("serviceLogin?sid=xiaomiio&_json=true")?;
+        trace!("尝试获取 xiaomiio 登录态: {url}");
+        let response = client.get(url.clone()).send().await?.error_for_status()?;
+        let bytes = response.bytes().await?;
+        let raw = decode_account_json(&bytes)?;
+        trace!("xiaomiio 初步登录响应: {raw}");
+        let auth = parse_service_auth_response(raw)?;
+        let client_sign = account_client_sign(&auth.ssecurity, &auth.nonce);
+        let location = Url::parse_with_params(&auth.location, [("clientSign", client_sign)])?;
+        trace!("尝试获取 xiaomiio serviceToken: {location}");
+        let response = client
+            .get(location.clone())
+            .send()
+            .await?
+            .error_for_status()?;
+        let service_token = response
+            .cookies()
+            .find(|cookie| cookie.name() == "serviceToken")
+            .map(|cookie| cookie.value().to_owned())
+            .or_else(|| self.cookie_value("serviceToken"))
+            .ok_or_else(|| Error::Login("xiaomiio 响应缺少 `serviceToken`".to_owned()))?;
+        let user_id = self
+            .cookie_value("userId")
+            .ok_or_else(|| Error::Login("当前登录状态缺少 `userId`".to_owned()))?;
+        let device_id = self
+            .cookie_value("deviceId")
+            .ok_or_else(|| Error::Login("当前登录状态缺少 `deviceId`".to_owned()))?;
+        trace!(
+            "获取到 xiaomiio 登录态: user_id={user_id}, device_id={device_id}, service_token_len={}",
+            service_token.len()
+        );
+
+        Ok(MiioAuth {
+            device_id,
+            service_token,
+            ssecurity: auth.ssecurity,
+            user_id,
+        })
+    }
+
+    fn cookie_value(&self, name: &str) -> Option<String> {
+        self.cookie_store
+            .lock()
+            .unwrap()
+            .iter_any()
+            .find(|cookie| cookie.name() == name)
+            .map(|cookie| cookie.value().to_owned())
+    }
 }
 
 /// 表示播放器的播放状态。
@@ -381,6 +598,40 @@ pub struct DeviceInfo {
 
     /// 机型。
     pub hardware: String,
+
+    /// MiIO / MIoT 设备 DID。
+    #[serde(
+        rename = "miotDID",
+        default,
+        deserialize_with = "deserialize_optional_string"
+    )]
+    pub miot_did: Option<String>,
+
+    /// 设备在线状态。
+    #[serde(default)]
+    pub presence: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct MiioAuth {
+    device_id: String,
+    service_token: String,
+    ssecurity: String,
+    user_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ServiceAuthResponse {
+    location: String,
+    nonce: serde_json::Number,
+    ssecurity: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MiioSignedPayload {
+    _nonce: String,
+    data: String,
+    signature: String,
 }
 
 fn random_request_id() -> String {
@@ -388,4 +639,146 @@ fn random_request_id() -> String {
     request_id.insert_str(0, "app_ios_");
 
     request_id
+}
+
+fn miio_tts_command(hardware: &str) -> Option<&'static str> {
+    match hardware {
+        "OH2" | "ASX4B" | "L05B" | "L05C" => Some("5-3"),
+        "OH2P" | "L15A" | "X10A" | "L17A" | "X6A" | "X08E" => Some("7-3"),
+        "LX06" | "S12" | "LX5A" | "LX01" | "LX05" | "L06A" | "LX04" => Some("5-1"),
+        "L09A" => Some("3-1"),
+        _ => None,
+    }
+}
+
+fn miio_ask_command(hardware: &str) -> Option<&'static str> {
+    match hardware {
+        "L05B" | "L05C" | "LX04" => Some("5-4"),
+        "LX06" | "S12" | "S12A" | "LX01" | "L06A" | "LX05A" | "LX5A" | "L07A" => Some("5-5"),
+        "L17A" | "X08E" | "L15A" | "X6A" | "X10A" => Some("7-4"),
+        _ => None,
+    }
+}
+
+fn parse_miio_action(command: &str) -> crate::Result<(u32, u32)> {
+    let Some((siid, aiid)) = command.split_once('-') else {
+        return Err(Error::Login(format!("无法识别的 MiIO 动作命令: {command}")));
+    };
+    let siid = siid
+        .parse()
+        .map_err(|_| Error::Login(format!("无法识别的 MiIO siid: {command}")))?;
+    let aiid = aiid
+        .parse()
+        .map_err(|_| Error::Login(format!("无法识别的 MiIO aiid: {command}")))?;
+
+    Ok((siid, aiid))
+}
+
+fn sign_miio_data(uri: &str, data: &str, ssecurity: &str) -> crate::Result<MiioSignedPayload> {
+    let nonce = miio_nonce();
+    let snonce = sign_nonce(ssecurity, &nonce)?;
+    let msg = [
+        uri,
+        snonce.as_str(),
+        nonce.as_str(),
+        &format!("data={data}"),
+    ]
+    .join("&");
+    let key = decode_base64(&snonce)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key)
+        .map_err(|error| Error::Login(format!("MiIO HMAC 初始化失败: {error}")))?;
+    mac.update(msg.as_bytes());
+    let signature = Base64::encode_string(&mac.finalize().into_bytes());
+
+    Ok(MiioSignedPayload {
+        _nonce: nonce,
+        data: data.to_owned(),
+        signature,
+    })
+}
+
+fn sign_nonce(ssecurity: &str, nonce: &str) -> crate::Result<String> {
+    let mut sha = Sha256::new();
+    sha.update(decode_base64(ssecurity)?);
+    sha.update(decode_base64(nonce)?);
+
+    Ok(Base64::encode_string(&sha.finalize()))
+}
+
+fn miio_nonce() -> String {
+    let mut nonce = Vec::with_capacity(12);
+    nonce.extend_from_slice(&rand::random::<[u8; 8]>());
+    let minutes = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 60;
+    nonce.extend_from_slice(&(minutes as u32).to_be_bytes());
+
+    Base64::encode_string(&nonce)
+}
+
+fn decode_base64(value: &str) -> crate::Result<Vec<u8>> {
+    Base64::decode_vec(value).map_err(|error| Error::Login(format!("Base64 解码失败: {error}")))
+}
+
+fn decode_account_json(bytes: &[u8]) -> crate::Result<Value> {
+    if bytes.len() < 11 {
+        return Err(Error::Login("小米账号响应过短".to_owned()));
+    }
+
+    Ok(serde_json::from_slice(&bytes[11..])?)
+}
+
+fn parse_service_auth_response(response: Value) -> crate::Result<ServiceAuthResponse> {
+    serde_json::from_value(response.clone()).map_err(|_| {
+        Error::Login(format!(
+            "当前登录状态无法直接换取 xiaomiio token，请重新登录: {response}"
+        ))
+    })
+}
+
+fn account_client_sign(ssecurity: &str, nonce: &serde_json::Number) -> String {
+    let mut sha = Sha1::new();
+    sha.update(format!("nonce={nonce}&{ssecurity}"));
+
+    Base64::encode_string(&sha.finalize())
+}
+
+fn miio_response(response: Value) -> XiaoaiResponse {
+    let code = response.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    let message = response
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("MiIO 请求已完成")
+        .to_owned();
+
+    XiaoaiResponse {
+        code,
+        message,
+        data: response,
+    }
+}
+
+fn is_auth_error(error: &Error) -> bool {
+    match error {
+        Error::Login(message) => message.contains("未授权") || message.contains("auth"),
+        Error::Reqwest(error) => error.status() == Some(reqwest::StatusCode::UNAUTHORIZED),
+        _ => false,
+    }
+}
+
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+
+    Ok(value.and_then(|value| match value {
+        Value::Null => None,
+        Value::String(value) => Some(value),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        other => Some(other.to_string()),
+    }))
 }
