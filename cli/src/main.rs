@@ -1,15 +1,21 @@
 use std::{
+    env,
     fmt::Display,
-    fs::File,
+    fs::{self, File},
     io::{self, BufReader},
     mem::take,
     path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use inquire::{Confirm, Password, PasswordDisplayMode, Select, Text};
-use miai::{DeviceInfo, PlayState, Xiaoai, conversation::AnswerPayload};
+use miai::{
+    DeviceInfo, Error as MiaiError, PlayState, Xiaoai,
+    conversation::AnswerPayload,
+    login::{CaptchaChallenge, Login, LoginResponse, LoginStep, VerificationChallenge},
+};
 use once_cell::unsync::OnceCell;
 use serde_json::Value;
 use time::{OffsetDateTime, UtcOffset};
@@ -27,26 +33,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
 
-    if let Commands::Login = cli.command {
-        let username = Text::new("账号:").prompt()?;
-        let password = Password::new("密码:")
-            .with_display_toggle_enabled()
-            .with_display_mode(PasswordDisplayMode::Masked)
-            .without_confirmation()
-            .with_help_message("CTRL + R 显示/隐藏密码")
-            .prompt()?;
-        let xiaoai = Xiaoai::login(&username, &password).await?;
-
-        let can_save = if cli.auth_file.exists() {
-            Confirm::new(&format!("{} 已存在，是否覆盖?", cli.auth_file.display())).prompt()?
-        } else {
-            true
-        };
-
-        if can_save {
-            let mut file = File::create(cli.auth_file)?;
-            xiaoai.save(&mut file).map_err(anyhow::Error::from_boxed)?;
-        }
+    if matches!(&cli.command, Commands::Login) {
+        let xiaoai = prompt_login().await?;
+        save_auth_file(&cli.auth_file, &xiaoai)?;
         return Ok(());
     }
 
@@ -128,6 +117,124 @@ async fn main() -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(&response)?);
 
     Ok(())
+}
+
+async fn prompt_login() -> anyhow::Result<Xiaoai> {
+    let username = Text::new("账号:").prompt()?;
+    let password = Password::new("密码:")
+        .with_display_toggle_enabled()
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .without_confirmation()
+        .with_help_message("CTRL + R 显示/隐藏密码")
+        .prompt()?;
+    let login = Login::new(&username, &password)?;
+    let mut pending = None;
+
+    let auth_response = loop {
+        match pending.take() {
+            Some(PendingAuth::Captcha(login_response, challenge)) => {
+                let captcha = prompt_captcha(&challenge)?;
+                match login
+                    .auth_with_captcha(login_response.clone(), &challenge, &captcha)
+                    .await
+                {
+                    Ok(auth_response) => break auth_response,
+                    Err(MiaiError::NeedCaptcha(challenge)) => {
+                        pending = Some(PendingAuth::Captcha(login_response, challenge));
+                    }
+                    Err(MiaiError::NeedVerification(challenge)) => {
+                        prompt_verification(&login, &challenge).await?;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            _ => match login.begin().await? {
+                LoginStep::Authenticated(auth_response) => break auth_response,
+                LoginStep::NeedAuth(login_response) => {
+                    match login.auth(login_response.clone()).await {
+                        Ok(auth_response) => break auth_response,
+                        Err(MiaiError::NeedCaptcha(challenge)) => {
+                            pending = Some(PendingAuth::Captcha(login_response, challenge));
+                        }
+                        Err(MiaiError::NeedVerification(challenge)) => {
+                            prompt_verification(&login, &challenge).await?;
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+            },
+        }
+    };
+
+    login.get_token(auth_response).await?;
+
+    Ok(Xiaoai::from_login(login)?)
+}
+
+fn save_auth_file(auth_file: &PathBuf, xiaoai: &Xiaoai) -> anyhow::Result<()> {
+    let can_save = if auth_file.exists() {
+        Confirm::new(&format!("{} 已存在，是否覆盖?", auth_file.display())).prompt()?
+    } else {
+        true
+    };
+
+    if can_save {
+        let mut file = File::create(auth_file)?;
+        xiaoai.save(&mut file).map_err(anyhow::Error::from_boxed)?;
+    }
+
+    Ok(())
+}
+
+fn prompt_captcha(challenge: &CaptchaChallenge) -> anyhow::Result<String> {
+    let path = write_captcha_image(challenge)?;
+    println!("登录需要图片验证码。");
+    println!("验证码图片已保存到: {}", path.display());
+    println!("验证码地址: {}", challenge.url);
+
+    Text::new("图片验证码:")
+        .with_help_message("打开图片后输入看到的验证码")
+        .prompt()
+        .map_err(Into::into)
+}
+
+async fn prompt_verification(
+    login: &Login,
+    challenge: &VerificationChallenge,
+) -> anyhow::Result<()> {
+    println!("登录需要二次验证。");
+    println!("验证地址: {}", challenge.url);
+    let ticket = Text::new("二次验证码:")
+        .with_help_message("输入手机或邮箱收到的验证码")
+        .prompt()?;
+    login.submit_verification(challenge, &ticket).await?;
+
+    Ok(())
+}
+
+fn write_captcha_image(challenge: &CaptchaChallenge) -> anyhow::Result<PathBuf> {
+    let extension = match challenge.content_type.as_deref() {
+        Some("image/jpeg") => "jpg",
+        Some("image/gif") => "gif",
+        Some("image/webp") => "webp",
+        _ => "png",
+    };
+    let filename = format!("miai-captcha-{}.{}", unix_millis(), extension);
+    let path = env::temp_dir().join(filename);
+    fs::write(&path, &challenge.image)?;
+
+    Ok(path)
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+enum PendingAuth {
+    Captcha(LoginResponse, CaptchaChallenge),
 }
 
 #[derive(Parser)]

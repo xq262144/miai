@@ -15,7 +15,11 @@ use serde_json::json;
 use time::OffsetDateTime;
 use tracing::trace;
 
-use crate::{XiaoaiResponse, conversation, login::Login, util::random_id};
+use crate::{
+    XiaoaiResponse, conversation,
+    login::{Login, LoginStep},
+    util::random_id,
+};
 
 const API_SERVER: &str = "https://api2.mina.mi.com/";
 const API_UA: &str = "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103 MICO/iOSApp/appStore/6.0.103";
@@ -35,8 +39,10 @@ impl Xiaoai {
     /// 登录以调用小爱服务。
     pub async fn login(username: &str, password: &str) -> crate::Result<Self> {
         let login = Login::new(username, password)?;
-        let login_response = login.login().await?;
-        let auth_response = login.auth(login_response).await?;
+        let auth_response = match login.begin().await? {
+            LoginStep::NeedAuth(login_response) => login.auth(login_response).await?,
+            LoginStep::Authenticated(auth_response) => auth_response,
+        };
         login.get_token(auth_response).await?;
 
         Self::from_login(login)
