@@ -35,6 +35,9 @@ const ACCOUNT_SERVER: &str = "https://account.xiaomi.com/pass/";
 const ACCOUNT_UA: &str = "APP/com.xiaomi.mihome APPV/6.0.103 iosPassportSDK/3.9.0 iOS/14.4 miHSTS";
 const MIIO_SERVER: &str = "https://api.io.mi.com/app";
 const MIIO_UA: &str = "iOS-14.4-6.0.103-iPhone12,3--D7744744F7AF32F0544445285880DD63E47D9BE9-8816080-84A3F44E137B71AE-iPhone";
+const CACHE_SERVER: &str = "https://miai.local/";
+const MIIO_CACHE_SERVICE_TOKEN_COOKIE: &str = "miai_xiaomiio_service_token";
+const MIIO_CACHE_SSECURITY_COOKIE: &str = "miai_xiaomiio_ssecurity";
 
 /// 提供小爱服务请求。
 ///
@@ -507,6 +510,15 @@ impl Xiaoai {
             return Ok(auth);
         }
 
+        if let Some(auth) = self.cached_miio_auth()? {
+            trace!(
+                "复用已缓存的 xiaomiio 登录态: user_id={}, device_id={}",
+                auth.user_id, auth.device_id
+            );
+            *self.miio_auth.lock().unwrap() = Some(auth.clone());
+            return Ok(auth);
+        }
+
         let auth = self.login_xiaomiio().await?;
         *self.miio_auth.lock().unwrap() = Some(auth.clone());
 
@@ -515,6 +527,13 @@ impl Xiaoai {
 
     fn clear_miio_auth(&self) {
         *self.miio_auth.lock().unwrap() = None;
+        if let Ok(cache_url) = Url::parse(CACHE_SERVER) {
+            if let Some(domain) = cache_url.domain() {
+                let mut store = self.cookie_store.lock().unwrap();
+                store.remove(domain, "/", MIIO_CACHE_SERVICE_TOKEN_COOKIE);
+                store.remove(domain, "/", MIIO_CACHE_SSECURITY_COOKIE);
+            }
+        }
     }
 
     async fn login_xiaomiio(&self) -> crate::Result<MiioAuth> {
@@ -554,13 +573,15 @@ impl Xiaoai {
             "获取到 xiaomiio 登录态: user_id={user_id}, device_id={device_id}, service_token_len={}",
             service_token.len()
         );
-
-        Ok(MiioAuth {
+        let auth = MiioAuth {
             device_id,
             service_token,
             ssecurity: auth.ssecurity,
             user_id,
-        })
+        };
+        self.persist_miio_auth(&auth)?;
+
+        Ok(auth)
     }
 
     fn cookie_value(&self, name: &str) -> Option<String> {
@@ -570,6 +591,62 @@ impl Xiaoai {
             .iter_any()
             .find(|cookie| cookie.name() == name)
             .map(|cookie| cookie.value().to_owned())
+    }
+
+    fn request_cookie_value(&self, url: &Url, name: &str) -> Option<String> {
+        self.cookie_store
+            .lock()
+            .unwrap()
+            .get_request_values(url)
+            .find(|(cookie_name, _)| *cookie_name == name)
+            .map(|(_, value)| value.to_owned())
+    }
+
+    fn cached_miio_auth(&self) -> crate::Result<Option<MiioAuth>> {
+        let cache_url = Url::parse(CACHE_SERVER)?;
+        let service_token = self.request_cookie_value(&cache_url, MIIO_CACHE_SERVICE_TOKEN_COOKIE);
+        let ssecurity = self.request_cookie_value(&cache_url, MIIO_CACHE_SSECURITY_COOKIE);
+        let Some(service_token) = service_token else {
+            return Ok(None);
+        };
+        let Some(ssecurity) = ssecurity else {
+            return Ok(None);
+        };
+        let Some(user_id) = self.cookie_value("userId") else {
+            return Ok(None);
+        };
+        let Some(device_id) = self.cookie_value("deviceId") else {
+            return Ok(None);
+        };
+
+        Ok(Some(MiioAuth {
+            device_id,
+            service_token,
+            ssecurity,
+            user_id,
+        }))
+    }
+
+    fn persist_miio_auth(&self, auth: &MiioAuth) -> crate::Result<()> {
+        let cache_url = Url::parse(CACHE_SERVER)?;
+        let service_token =
+            RawCookie::build((MIIO_CACHE_SERVICE_TOKEN_COOKIE, auth.service_token.as_str()))
+                .path("/")
+                .build();
+        let ssecurity = RawCookie::build((MIIO_CACHE_SSECURITY_COOKIE, auth.ssecurity.as_str()))
+            .path("/")
+            .build();
+        let mut store = self.cookie_store.lock().unwrap();
+        store.insert_raw(&service_token, &cache_url)?;
+        store.insert_raw(&ssecurity, &cache_url)?;
+        trace!(
+            "已缓存 xiaomiio 登录态: user_id={}, device_id={}, service_token_len={}",
+            auth.user_id,
+            auth.device_id,
+            auth.service_token.len()
+        );
+
+        Ok(())
     }
 }
 

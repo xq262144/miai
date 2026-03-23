@@ -115,6 +115,9 @@ async fn main() -> anyhow::Result<()> {
         cmd => unreachable!("命令 `{:?}` 应该被处理", cmd),
     };
     println!("{}", serde_json::to_string_pretty(&response)?);
+    if let Err(error) = persist_auth_file(&cli.auth_file, xiaoai) {
+        eprintln!("警告: 更新认证缓存失败: {error}");
+    }
 
     Ok(())
 }
@@ -179,9 +182,15 @@ fn save_auth_file(auth_file: &PathBuf, xiaoai: &Xiaoai) -> anyhow::Result<()> {
     };
 
     if can_save {
-        let mut file = File::create(auth_file)?;
-        xiaoai.save(&mut file).map_err(anyhow::Error::from_boxed)?;
+        persist_auth_file(auth_file, xiaoai)?;
     }
+
+    Ok(())
+}
+
+fn persist_auth_file(auth_file: &PathBuf, xiaoai: &Xiaoai) -> anyhow::Result<()> {
+    let mut file = File::create(auth_file)?;
+    xiaoai.save(&mut file).map_err(anyhow::Error::from_boxed)?;
 
     Ok(())
 }
