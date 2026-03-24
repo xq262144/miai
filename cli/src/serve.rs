@@ -671,6 +671,9 @@ impl OpencodeChat {
             .bearer_auth(&self.api_key)
             .json(&json!({
                 "model": model_name,
+                "thinking": {
+                    "type": "disabled"
+                },
                 "messages": [
                     {"role": "system", "content": CHAT_SYSTEM_PROMPT},
                     {"role": "user", "content": query}
