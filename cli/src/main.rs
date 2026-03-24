@@ -23,6 +23,8 @@ use time::{OffsetDateTime, UtcOffset};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
+mod serve;
+
 const DEFAULT_AUTH_FILE: &str = "xiaoai-auth.json";
 
 #[tokio::main(flavor = "current_thread")]
@@ -54,6 +56,15 @@ async fn main() -> anyhow::Result<()> {
             }
             print!("{}", DisplayDeviceInfo(info));
         }
+        return Ok(());
+    }
+    if let Commands::Serve {
+        interval,
+        mute_reply,
+        chat,
+    } = &cli.command
+    {
+        serve::run_serve(&cli, *interval, *mute_reply, *chat).await?;
         return Ok(());
     }
 
@@ -363,6 +374,20 @@ enum Commands {
         /// 最大条数
         #[arg(short = 'n', long, default_value_t = 1)]
         limit: u32,
+    },
+    /// 监听对话并提供交互输入
+    Serve {
+        /// 轮询最新对话的时间间隔，单位秒
+        #[arg(long, default_value_t = 1.0)]
+        interval: f32,
+
+        /// 自动暂停小爱的回复
+        #[arg(long)]
+        mute_reply: bool,
+
+        /// 使用 opencode 默认 provider/model 自动回复
+        #[arg(long)]
+        chat: bool,
     },
     /// OpenWrt UBUS call
     Ubus {
